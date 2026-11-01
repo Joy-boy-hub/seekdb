@@ -2682,6 +2682,42 @@ int ObTransformSimplifyExpr::recursive_remove_duplicate_exprs(ObQueryCtx &query_
       } else {
         trans_happened = true; 
       }
+    } else if (expr->get_expr_type() == T_OP_IN || expr->get_expr_type() == T_OP_NOT_IN) {
+      // Fix for issue #1512: collapse duplicated constants in an IN / NOT IN
+      // value list, e.g.  c IN (1, 2, 2)  ->  c IN (1, 2).
+      // A duplicate-heavy list inflates the predicate and can push the
+      // optimizer into a VALUES-table + subplan rewrite, which changes the
+      // vector-index adaptive-scan path and costs several times the latency
+      // of the equivalent compact predicate.  Normalizing the list here lets
+      // both spellings share the same plan.
+      // Only lists whose members are all constant expressions are touched, so
+      // no volatile expression is evaluated fewer times than before; IN lists
+      // over subqueries or row constructors are left alone.
+      ObOpRawExpr *in_expr = static_cast<ObOpRawExpr *>(expr);
+      ObRawExpr *row_expr = (2 == in_expr->get_param_count())
+                            ? in_expr->get_param_expr(1) : NULL;
+      bool all_const = (NULL != row_expr
+                        && T_OP_ROW == row_expr->get_expr_type()
+                        && row_expr->get_param_count() > 1
+                        && row_expr->get_param_count() <= 10000);
+      for (int64_t i = 0; OB_SUCC(ret) && all_const && i < row_expr->get_param_count(); ++i) {
+        ObRawExpr *member = row_expr->get_param_expr(i);
+        if (OB_ISNULL(member) || !member->is_const_expr()) {
+          all_const = false;
+        }
+      }
+      if (OB_SUCC(ret) && all_const) {
+        ObOpRawExpr *row_op_expr = static_cast<ObOpRawExpr *>(row_expr);
+        ObSEArray<ObRawExpr *, 4> members;
+        if (OB_FAIL(members.assign(row_op_expr->get_param_exprs()))) {
+        } else if (OB_FAIL(do_remove_duplicate_exprs(query_ctx, members))) {
+        } else if (members.count() == row_expr->get_param_count()) {
+          // no duplicated constants; keep the original list
+        } else if (OB_FAIL(row_op_expr->set_param_exprs(members))) {
+        } else {
+          trans_happened = true;
+        }
+      }
     }
   }
   return ret;
